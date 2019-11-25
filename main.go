@@ -4,12 +4,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	_ "github.com/lib/pq"
-	_ "gopkg.in/goracle.v2"
-	_ "github.com/go-sql-driver/mysql"
 	"io/ioutil"
 	"log"
 	"os"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/lib/pq"
+	_ "gopkg.in/goracle.v2"
 )
 
 type Query struct {
@@ -18,7 +20,27 @@ type Query struct {
 	QueryString     string   `json:"query_string"`
 	RefreshTime     int      `json:"refresh_time"`
 	ColumnList      []string `json:"column_list"`
-	lastRefreshTime int
+	RowList         []string `json:"row_list"`
+	lastRefreshTime time.Time
+	lastDatablock   Datablock
+}
+
+type Page struct {
+	Layout [][]string
+}
+
+type Widget struct {
+	Name             string
+	QueryName        string
+	currentDataBlock Datablock
+}
+
+type Datablock struct {
+	Title       string
+	ColumnList  []string
+	RowList     []string
+	Rowdata     map[int][]interface{}
+	UpdatedTime time.Time
 }
 
 type DbConfig struct {
@@ -73,7 +95,6 @@ func (cfg MySQLConfig) connectionString() string {
 		cfg.Username, cfg.Password, cfg.Host, cfg.Port, cfg.DBName)
 }
 
-
 func main() {
 
 	var dbMap = make(map[string]sql.DB)
@@ -88,6 +109,7 @@ func main() {
 
 	dbList := []sql.DB{}
 
+	// use the db json files and create the different sql.Db into the dbMap
 	for _, file := range dbFiles {
 		queryFile, err := os.Open(cfgPathDB + file.Name())
 		if err != nil {
@@ -116,6 +138,11 @@ func main() {
 				return
 			}
 			defer db.Close()
+
+			err = db.Ping()
+			if err != nil {
+				fmt.Println(err)
+			}
 
 			dbList = append(dbList, *db)
 			dbMap[oracleDB.Name] = *db
@@ -151,6 +178,11 @@ func main() {
 				return
 			}
 			defer db.Close()
+
+			err = db.Ping()
+			if err != nil {
+				fmt.Println(err)
+			}
 
 			dbList = append(dbList, *db)
 			dbMap[mysqlDB.Name] = *db
@@ -195,19 +227,58 @@ func main() {
 		if found == false {
 			fmt.Println("Could not find database in DB map ", v.DatabaseName)
 		} else {
-			rows, err := db.Query(v.QueryString)
+
+			datablock, err := getResults(db, v)
 			if err != nil {
-				fmt.Println("Error running query", v.Name)
-				fmt.Println(err)
-				return
+				fmt.Println("Error getting results from query ", err)
 			}
-			defer rows.Close()
-			var thedate string
-			for rows.Next() {
-				rows.Scan(&thedate)
-			}
-			fmt.Printf("The query result is: %s\n", thedate)
+			fmt.Println(datablock)
 		}
 	}
+}
 
+func getResults(db sql.DB, v Query) (Datablock, error) {
+	var result Datablock
+	var allResults = make(map[int][]interface{})
+	rows, err := db.Query(v.QueryString)
+	if err != nil {
+		return result, err
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return result, err
+	}
+	rowCount := 0
+	for rows.Next() {
+		// Create a slice of interface{}'s to represent each column,
+		// and a second slice to contain pointers to each item in the columns slice.
+		columns := make([]interface{}, len(cols))
+		columnPointers := make([]interface{}, len(cols))
+		rowCount = rowCount + 1
+
+		for i, _ := range columns {
+			columnPointers[i] = &columns[i]
+		}
+
+		// Scan the result into the column pointers...
+		err := rows.Scan(columnPointers...)
+		if err != nil {
+			return result, err
+		}
+
+		allResults[rowCount] = columns
+	}
+
+	datablock := Datablock{
+		Title:       v.Name,
+		ColumnList:  v.ColumnList,
+		RowList:     v.RowList,
+		Rowdata:     allResults,
+		UpdatedTime: time.Now(),
+	}
+
+	v.lastDatablock = datablock
+	v.lastRefreshTime = time.Now()
+	return datablock, nil
 }
