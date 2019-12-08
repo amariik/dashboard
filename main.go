@@ -111,8 +111,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	dbList := []sql.DB{}
-
 	// use the db json files and create the different sql.Db into the dbMap
 	for _, file := range dbFiles {
 		queryFile, err := os.Open(cfgPathDB + file.Name())
@@ -148,7 +146,6 @@ func main() {
 				fmt.Println(err)
 			}
 
-			dbList = append(dbList, *db)
 			dbMap[oracleDB.Name] = db
 		} else if genericDB.DBType == "postgres" {
 			var postgresDB PostgresConfig
@@ -168,7 +165,6 @@ func main() {
 				fmt.Println(err)
 			}
 
-			dbList = append(dbList, *db)
 			dbMap[postgresDB.Name] = db
 		} else if genericDB.DBType == "mysql" {
 			var mysqlDB MySQLConfig
@@ -188,7 +184,6 @@ func main() {
 				fmt.Println(err)
 			}
 
-			dbList = append(dbList, *db)
 			dbMap[mysqlDB.Name] = db
 		} else {
 			fmt.Println("Unknown db type ", genericDB.DBType)
@@ -202,7 +197,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	queryList := []Query{}
 	for _, file := range queryFiles {
 		queryFile, err := os.Open(cfgPathQuery + file.Name())
 		if err != nil {
@@ -218,7 +212,6 @@ func main() {
 
 		var query Query
 		json.Unmarshal(jsonData, &query)
-		queryList = append(queryList, query)
 		queryMap[query.Name] = &query
 
 		//fmt.Println(query.Name, query.DatabaseName, query.QueryString, query.ColumnList)
@@ -231,7 +224,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	widgetList := []Widget{}
 	for _, file := range widgetFiles {
 		widgetFile, err := os.Open(cfgPathWidget + file.Name())
 		if err != nil {
@@ -247,7 +239,6 @@ func main() {
 
 		var widget Widget
 		json.Unmarshal(jsonData, &widget)
-		widgetList = append(widgetList, widget)
 		widgetMap[widget.Name] = &widget
 
 		query, found := queryMap[widget.QueryName]
@@ -267,7 +258,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	pageList := []Page{}
 	for _, file := range pageFiles {
 		pageFile, err := os.Open(cfgPathPage + file.Name())
 		if err != nil {
@@ -283,7 +273,6 @@ func main() {
 
 		var page Page
 		json.Unmarshal(jsonData, &page)
-		pageList = append(pageList, page)
 		pageMap[page.Name] = &page
 	}
 
@@ -312,12 +301,12 @@ func main() {
 						if found != true {
 							fmt.Println("Could not find query in query map ", widget.QueryName)
 						} else {
-							dbFromMap, found := dbMap[query.DatabaseName]
+							db, found := dbMap[query.DatabaseName]
 
 							if found == false {
 								fmt.Println("Could not find database in DB map ", query.DatabaseName)
 							} else {
-								datablock, err := getUpdatedDatablock(dbFromMap, query)
+								datablock, err := getUpdatedDatablock(db, query)
 								if err != nil {
 									fmt.Println("Error getting results from query ", err)
 								}
@@ -340,14 +329,14 @@ func main() {
 
 // if current time minus last time (all in seconds) is greater than the refreshtime (refresh limiter) then update
 // the data block otherwise return the queries last datablock
-func getUpdatedDatablock(db1 *sql.DB, v *Query) (Datablock, error) {
+func getUpdatedDatablock(db *sql.DB, v *Query) (Datablock, error) {
 
 	timeSinceLastRefresh := time.Now().Unix() - v.lastRefreshTime.Unix()
 	if timeSinceLastRefresh > int64(v.RefreshTime) {
 		var result Datablock
 
 		var allResults = make(map[int][]interface{})
-		rows, err := db1.Query(v.QueryString)
+		rows, err := db.Query(v.QueryString)
 		if err != nil {
 			return result, err
 		}
