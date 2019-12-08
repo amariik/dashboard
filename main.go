@@ -26,12 +26,13 @@ type Query struct {
 }
 
 type Page struct {
-	Layout [][]string
+	Name   string     `json:"name"`
+	Layout [][]string `json:"layout"`
 }
 
 type Widget struct {
-	Name             string
-	QueryName        string
+	Name             string `json:"name"`
+	QueryName        string `json:"query_name"`
 	currentDataBlock Datablock
 }
 
@@ -97,8 +98,11 @@ func (cfg MySQLConfig) connectionString() string {
 
 func main() {
 
-	var dbMap = make(map[string]sql.DB)
-	var queryMap = make(map[string]Query)
+	var dbMap = make(map[string]*sql.DB)
+	var queryMap = make(map[string]*Query)
+	var widgetMap = make(map[string]*Widget)
+	var widgetQueryMap = make(map[string]*Query)
+	var pageMap = make(map[string]*Page)
 
 	// read the cfg/db folder and create db instances for the json files
 	const cfgPathDB = "./cfg/db/"
@@ -145,7 +149,7 @@ func main() {
 			}
 
 			dbList = append(dbList, *db)
-			dbMap[oracleDB.Name] = *db
+			dbMap[oracleDB.Name] = db
 		} else if genericDB.DBType == "postgres" {
 			var postgresDB PostgresConfig
 
@@ -165,7 +169,7 @@ func main() {
 			}
 
 			dbList = append(dbList, *db)
-			dbMap[postgresDB.Name] = *db
+			dbMap[postgresDB.Name] = db
 		} else if genericDB.DBType == "mysql" {
 			var mysqlDB MySQLConfig
 
@@ -185,7 +189,7 @@ func main() {
 			}
 
 			dbList = append(dbList, *db)
-			dbMap[mysqlDB.Name] = *db
+			dbMap[mysqlDB.Name] = db
 		} else {
 			fmt.Println("Unknown db type ", genericDB.DBType)
 		}
@@ -215,70 +219,177 @@ func main() {
 		var query Query
 		json.Unmarshal(jsonData, &query)
 		queryList = append(queryList, query)
-		queryMap[query.Name] = query
+		queryMap[query.Name] = &query
 
 		//fmt.Println(query.Name, query.DatabaseName, query.QueryString, query.ColumnList)
 	}
 
-	for _, v := range queryList {
+	// read the cfg/widget folder and load all the widget json files
+	const cfgPathWidget = "./cfg/widget/"
+	widgetFiles, err := ioutil.ReadDir(cfgPathWidget)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-		db, found := dbMap[v.DatabaseName]
+	widgetList := []Widget{}
+	for _, file := range widgetFiles {
+		widgetFile, err := os.Open(cfgPathWidget + file.Name())
+		if err != nil {
+			fmt.Println(err)
+		}
+		defer widgetFile.Close()
+
+		var jsonData []byte
+		jsonData, err = ioutil.ReadAll(widgetFile)
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		var widget Widget
+		json.Unmarshal(jsonData, &widget)
+		widgetList = append(widgetList, widget)
+		widgetMap[widget.Name] = &widget
+
+		query, found := queryMap[widget.QueryName]
 
 		if found == false {
-			fmt.Println("Could not find database in DB map ", v.DatabaseName)
+			fmt.Println("Could not find query in query map ", widget.QueryName)
+		} else {
+			widgetQueryMap[widget.Name] = query
+		}
+
+	}
+
+	// read the cfg/page folder and load all the page json files
+	const cfgPathPage = "./cfg/page/"
+	pageFiles, err := ioutil.ReadDir(cfgPathPage)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	pageList := []Page{}
+	for _, file := range pageFiles {
+		pageFile, err := os.Open(cfgPathPage + file.Name())
+		if err != nil {
+			fmt.Println(err)
+		}
+		defer pageFile.Close()
+
+		var jsonData []byte
+		jsonData, err = ioutil.ReadAll(pageFile)
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		var page Page
+		json.Unmarshal(jsonData, &page)
+		pageList = append(pageList, page)
+		pageMap[page.Name] = &page
+	}
+
+	var testPage = "page1"
+
+	for i := 0; i < 10; i++ {
+
+		requestedPage, found := pageMap[testPage]
+
+		var pageRequestResult = make([][]Datablock, 5)
+		for i := range pageRequestResult {
+			pageRequestResult[i] = make([]Datablock, 5)
+		}
+
+		if found != true {
+			fmt.Println("Could not find page in page map ", testPage)
 		} else {
 
-			datablock, err := getResults(db, v)
-			if err != nil {
-				fmt.Println("Error getting results from query ", err)
+			for i, row := range requestedPage.Layout {
+				for j, col := range row {
+					widget, found := widgetMap[col]
+					if found != true {
+						fmt.Println("Could not find widget in widget map ", col)
+					} else {
+						query, found := queryMap[widget.QueryName]
+						if found != true {
+							fmt.Println("Could not find query in query map ", widget.QueryName)
+						} else {
+							dbFromMap, found := dbMap[query.DatabaseName]
+
+							if found == false {
+								fmt.Println("Could not find database in DB map ", query.DatabaseName)
+							} else {
+								datablock, err := getUpdatedDatablock(dbFromMap, query)
+								if err != nil {
+									fmt.Println("Error getting results from query ", err)
+								}
+								fmt.Println("datablock is ", datablock)
+								pageRequestResult[i][j] = datablock
+							}
+						}
+					}
+				}
 			}
-			fmt.Println(datablock)
 		}
+
+		fmt.Println("*****************")
+		fmt.Println("page result is ", pageRequestResult)
+		fmt.Println("*****************")
+
+		time.Sleep(15 * time.Second)
 	}
 }
 
-func getResults(db sql.DB, v Query) (Datablock, error) {
-	var result Datablock
-	var allResults = make(map[int][]interface{})
-	rows, err := db.Query(v.QueryString)
-	if err != nil {
-		return result, err
-	}
-	defer rows.Close()
-	cols, err := rows.Columns()
-	if err != nil {
-		return result, err
-	}
-	rowCount := 0
-	for rows.Next() {
-		// Create a slice of interface{}'s to represent each column,
-		// and a second slice to contain pointers to each item in the columns slice.
-		columns := make([]interface{}, len(cols))
-		columnPointers := make([]interface{}, len(cols))
-		rowCount = rowCount + 1
+// if current time minus last time (all in seconds) is greater than the refreshtime (refresh limiter) then update
+// the data block otherwise return the queries last datablock
+func getUpdatedDatablock(db1 *sql.DB, v *Query) (Datablock, error) {
 
-		for i, _ := range columns {
-			columnPointers[i] = &columns[i]
-		}
+	timeSinceLastRefresh := time.Now().Unix() - v.lastRefreshTime.Unix()
+	if timeSinceLastRefresh > int64(v.RefreshTime) {
+		var result Datablock
 
-		// Scan the result into the column pointers...
-		err := rows.Scan(columnPointers...)
+		var allResults = make(map[int][]interface{})
+		rows, err := db1.Query(v.QueryString)
 		if err != nil {
 			return result, err
 		}
+		defer rows.Close()
+		cols, err := rows.Columns()
+		if err != nil {
+			return result, err
+		}
+		rowCount := 0
+		for rows.Next() {
+			// Create a slice of interface{}'s to represent each column,
+			// and a second slice to contain pointers to each item in the columns slice.
+			columns := make([]interface{}, len(cols))
+			columnPointers := make([]interface{}, len(cols))
+			rowCount = rowCount + 1
 
-		allResults[rowCount] = columns
+			for i, _ := range columns {
+				columnPointers[i] = &columns[i]
+			}
+
+			// Scan the result into the column pointers...
+			err := rows.Scan(columnPointers...)
+			if err != nil {
+				return result, err
+			}
+
+			allResults[rowCount] = columns
+		}
+
+		datablock := Datablock{
+			Title:       v.Name,
+			ColumnList:  v.ColumnList,
+			RowList:     v.RowList,
+			Rowdata:     allResults,
+			UpdatedTime: time.Now(),
+		}
+
+		v.lastDatablock = datablock
+		v.lastRefreshTime = time.Now()
+		return datablock, nil
+	} else {
+		return v.lastDatablock, nil
 	}
 
-	datablock := Datablock{
-		Title:       v.Name,
-		ColumnList:  v.ColumnList,
-		RowList:     v.RowList,
-		Rowdata:     allResults,
-		UpdatedTime: time.Now(),
-	}
-
-	v.lastDatablock = datablock
-	v.lastRefreshTime = time.Now()
-	return datablock, nil
 }
