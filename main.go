@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"time"
+
+	"github.com/go-chi/chi"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
@@ -96,13 +99,13 @@ func (cfg MySQLConfig) connectionString() string {
 		cfg.Username, cfg.Password, cfg.Host, cfg.Port, cfg.DBName)
 }
 
-func main() {
+var dbMap = make(map[string]*sql.DB)
+var queryMap = make(map[string]*Query)
+var widgetMap = make(map[string]*Widget)
+var pageMap = make(map[string]*Page)
+var widgetToQueryMap = make(map[string]*Query)
 
-	var dbMap = make(map[string]*sql.DB)
-	var queryMap = make(map[string]*Query)
-	var widgetMap = make(map[string]*Widget)
-	var widgetQueryMap = make(map[string]*Query)
-	var pageMap = make(map[string]*Page)
+func main() {
 
 	// read the cfg/db folder and create db instances for the json files
 	const cfgPathDB = "./cfg/db/"
@@ -246,7 +249,7 @@ func main() {
 		if found == false {
 			fmt.Println("Could not find query in query map ", widget.QueryName)
 		} else {
-			widgetQueryMap[widget.Name] = query
+			widgetToQueryMap[widget.Name] = query
 		}
 
 	}
@@ -276,55 +279,7 @@ func main() {
 		pageMap[page.Name] = &page
 	}
 
-	var testPage = "page1"
-
-	for i := 0; i < 10; i++ {
-
-		requestedPage, found := pageMap[testPage]
-
-		var pageRequestResult = make([][]Datablock, 5)
-		for i := range pageRequestResult {
-			pageRequestResult[i] = make([]Datablock, 5)
-		}
-
-		if found != true {
-			fmt.Println("Could not find page in page map ", testPage)
-		} else {
-
-			for i, row := range requestedPage.Layout {
-				for j, col := range row {
-					widget, found := widgetMap[col]
-					if found != true {
-						fmt.Println("Could not find widget in widget map ", col)
-					} else {
-						query, found := queryMap[widget.QueryName]
-						if found != true {
-							fmt.Println("Could not find query in query map ", widget.QueryName)
-						} else {
-							db, found := dbMap[query.DatabaseName]
-
-							if found == false {
-								fmt.Println("Could not find database in DB map ", query.DatabaseName)
-							} else {
-								datablock, err := getUpdatedDatablock(db, query)
-								if err != nil {
-									fmt.Println("Error getting results from query ", err)
-								}
-								fmt.Println("datablock is ", datablock)
-								pageRequestResult[i][j] = datablock
-							}
-						}
-					}
-				}
-			}
-		}
-
-		fmt.Println("*****************")
-		fmt.Println("page result is ", pageRequestResult)
-		fmt.Println("*****************")
-
-		time.Sleep(15 * time.Second)
-	}
+	http.ListenAndServe(":9000", registerRoutes())
 }
 
 // if current time minus last time (all in seconds) is greater than the refreshtime (refresh limiter) then update
@@ -381,4 +336,111 @@ func getUpdatedDatablock(db *sql.DB, v *Query) (Datablock, error) {
 		return v.lastDatablock, nil
 	}
 
+}
+
+func registerRoutes() http.Handler {
+	router := chi.NewRouter()
+	router.Get("/page/{pageName}", getPageHandler)
+	router.Get("/widget/{widgetName}", getWidgetHandler)
+	router.Get("/query/{queryName}", getQueryHandler)
+	return router
+}
+
+func getPageHandler(w http.ResponseWriter, r *http.Request) {
+	pageName := chi.URLParam(r, "pageName")
+
+	responseJson, httpCode, errorString := getPage(pageName)
+
+	if errorString != "" {
+		http.Error(w, errorString, httpCode)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(httpCode)
+		w.Write(responseJson)
+	}
+}
+
+// returns
+// json of page requested or nil if error
+// http status code to use in rsp
+// error string to pass back if error
+func getPage(pageName string) ([]byte, int, string) {
+	requestedPage, found := pageMap[pageName]
+
+	if found != true {
+		return nil, http.StatusNotFound, "Could not find page in page map " + pageName
+	} else {
+		response, err := json.Marshal(requestedPage)
+		if err == nil {
+			return response, http.StatusOK, ""
+		} else {
+			return nil, http.StatusInternalServerError, err.Error()
+		}
+	}
+}
+
+func getWidgetHandler(w http.ResponseWriter, r *http.Request) {
+	widgetName := chi.URLParam(r, "widgetName")
+
+	responseJson, httpCode, errorString := getWidget(widgetName)
+
+	if errorString != "" {
+		http.Error(w, errorString, httpCode)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(httpCode)
+		w.Write(responseJson)
+	}
+}
+
+// returns
+// json of widget requested or nil if error
+// http status code to use in rsp
+// error string to pass back if error
+func getWidget(widgetName string) ([]byte, int, string) {
+	requestedWidget, found := widgetMap[widgetName]
+
+	if found != true {
+		return nil, http.StatusNotFound, "Could not find widget in widget map " + widgetName
+	} else {
+		response, err := json.Marshal(requestedWidget)
+		if err == nil {
+			return response, http.StatusOK, ""
+		} else {
+			return nil, http.StatusInternalServerError, err.Error()
+		}
+	}
+}
+
+func getQueryHandler(w http.ResponseWriter, r *http.Request) {
+	queryName := chi.URLParam(r, "queryName")
+
+	responseJson, httpCode, errorString := getQuery(queryName)
+
+	if errorString != "" {
+		http.Error(w, errorString, httpCode)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(httpCode)
+		w.Write(responseJson)
+	}
+}
+
+// returns
+// json of query requested or nil if error
+// http status code to use in rsp
+// error string to pass back if error
+func getQuery(queryName string) ([]byte, int, string) {
+	requestedQuery, found := queryMap[queryName]
+
+	if found != true {
+		return nil, http.StatusNotFound, "Could not find query in query map " + queryName
+	} else {
+		response, err := json.Marshal(requestedQuery)
+		if err == nil {
+			return response, http.StatusOK, ""
+		} else {
+			return nil, http.StatusInternalServerError, err.Error()
+		}
+	}
 }
