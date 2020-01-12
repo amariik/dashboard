@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi"
@@ -25,6 +26,7 @@ type Query struct {
 	ColumnList      []string `json:"column_list"`
 	RowList         []string `json:"row_list"`
 	lastRefreshTime time.Time
+	Locker          uint32 // locker is used with atomic operation to control updating lastDatablock
 	lastDatablock   Datablock
 }
 
@@ -39,12 +41,20 @@ type Widget struct {
 	currentDataBlock Datablock
 }
 
+func (w *Widget) CurrentDataBlock() Datablock {
+	return w.currentDataBlock
+}
+
+func (w *Widget) SetCurrentDataBlock(currentDataBlock Datablock) {
+	w.currentDataBlock = currentDataBlock
+}
+
 type Datablock struct {
-	Title       string
-	ColumnList  []string
-	RowList     []string
-	Rowdata     map[int][]interface{}
-	UpdatedTime time.Time
+	Title       string                `json:"title"`
+	ColumnList  []string              `json:"column_list"`
+	RowList     []string              `json:"row_list"`
+	Rowdata     map[int][]interface{} `json:"rowdata"`
+	UpdatedTime time.Time             `json:"updated_time"`
 }
 
 type DbConfig struct {
@@ -284,10 +294,18 @@ func main() {
 
 // if current time minus last time (all in seconds) is greater than the refreshtime (refresh limiter) then update
 // the data block otherwise return the queries last datablock
-func getUpdatedDatablock(db *sql.DB, v *Query) (Datablock, error) {
+func getDatablockAndUpdateIfNeeded(db *sql.DB, v *Query) (Datablock, error) {
 
 	timeSinceLastRefresh := time.Now().Unix() - v.lastRefreshTime.Unix()
 	if timeSinceLastRefresh > int64(v.RefreshTime) {
+		// atomically check if the value of locker is 0 and if so change it to 1 (locked)
+		// if that is is false then return the older data as if it wasn't time to refresh
+		// as another process is updating this query currently
+		if !atomic.CompareAndSwapUint32(&v.Locker, 0, 1) {
+			return v.lastDatablock, nil
+		}
+		defer atomic.StoreUint32(&v.Locker, 0)
+
 		var result Datablock
 
 		var allResults = make(map[int][]interface{})
@@ -342,6 +360,7 @@ func registerRoutes() http.Handler {
 	router := chi.NewRouter()
 	router.Get("/page/{pageName}", getPageHandler)
 	router.Get("/widget/{widgetName}", getWidgetHandler)
+	router.Get("/widgetdata/{widgetName}", getWidgetDataHandler)
 	router.Get("/query/{queryName}", getQueryHandler)
 	return router
 }
@@ -441,6 +460,56 @@ func getQuery(queryName string) ([]byte, int, string) {
 			return response, http.StatusOK, ""
 		} else {
 			return nil, http.StatusInternalServerError, err.Error()
+		}
+	}
+}
+
+func getWidgetDataHandler(w http.ResponseWriter, r *http.Request) {
+	widgetName := chi.URLParam(r, "widgetName")
+
+	responseJson, httpCode, errorString := getWidgetData(widgetName)
+
+	if errorString != "" {
+		http.Error(w, errorString, httpCode)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(httpCode)
+		w.Write(responseJson)
+	}
+}
+
+// returns
+// json of widget's datablock requested or nil if error
+// http status code to use in rsp
+// error string to pass back if error
+func getWidgetData(widgetName string) ([]byte, int, string) {
+	widget, found := widgetMap[widgetName]
+	if found != true {
+		return nil, http.StatusNotFound, "Could not find widget in widget map " + widgetName
+	} else {
+		query, found := queryMap[widget.QueryName]
+		if found != true {
+			return nil, http.StatusNotFound, "Could not find query in query map " + widget.QueryName
+		} else {
+			db, found := dbMap[query.DatabaseName]
+
+			if found == false {
+				return nil, http.StatusNotFound, "Could not find database in DB map " + query.DatabaseName
+			} else {
+				datablock, err := getDatablockAndUpdateIfNeeded(db, query)
+				if err != nil {
+					return nil, http.StatusInternalServerError, "Error getting results from query " + err.Error()
+				}
+				widget.SetCurrentDataBlock(datablock)
+
+				response, err := json.Marshal(datablock)
+				if err == nil {
+					return response, http.StatusOK, ""
+				} else {
+					return nil, http.StatusInternalServerError, err.Error()
+				}
+
+			}
 		}
 	}
 }
