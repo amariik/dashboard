@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi"
+	"github.com/go-chi/cors"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
@@ -289,15 +290,16 @@ func main() {
 		pageMap[page.Name] = &page
 	}
 
-	http.ListenAndServe(":9000", registerRoutes())
+	http.ListenAndServe(":9999", registerRoutes())
 }
 
 // if current time minus last time (all in seconds) is greater than the refreshtime (refresh limiter) then update
 // the data block otherwise return the queries last datablock
 func getDatablockAndUpdateIfNeeded(db *sql.DB, v *Query) (Datablock, error) {
 
-	timeSinceLastRefresh := time.Now().Unix() - v.lastRefreshTime.Unix()
-	if timeSinceLastRefresh > int64(v.RefreshTime) {
+	//timeSinceLastRefresh := time.Now().Unix() - v.lastRefreshTime.Unix()
+	//if timeSinceLastRefresh > int64(v.RefreshTime) {
+	if v.lastDatablock.Rowdata == nil {
 		// atomically check if the value of locker is 0 and if so change it to 1 (locked)
 		// if that is is false then return the older data as if it wasn't time to refresh
 		// as another process is updating this query currently
@@ -358,11 +360,164 @@ func getDatablockAndUpdateIfNeeded(db *sql.DB, v *Query) (Datablock, error) {
 
 func registerRoutes() http.Handler {
 	router := chi.NewRouter()
+
+	// Basic CORS
+	// for more ideas, see: https://developer.github.com/v3/#cross-origin-resource-sharing
+	cors := cors.New(cors.Options{
+		// AllowedOrigins: []string{"https://foo.com"}, // Use this to allow specific origin hosts
+		AllowedOrigins: []string{"*"},
+		// AllowOriginFunc:  func(r *http.Request, origin string) bool { return true },
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300, // Maximum value not ignored by any of major browsers
+	})
+	router.Use(cors.Handler)
+
 	router.Get("/page/{pageName}", getPageHandler)
+	router.Get("/page/", getAllPagesHandler)
 	router.Get("/widget/{widgetName}", getWidgetHandler)
 	router.Get("/widgetdata/{widgetName}", getWidgetDataHandler)
 	router.Get("/query/{queryName}", getQueryHandler)
+
+	// grafana test
+	router.Get("/", getRoot)
+	router.Post("/search", postSearchHandler)
+	router.Post("/query", postQueryHandler)
+
 	return router
+}
+
+func postQueryHandler(writer http.ResponseWriter, request *http.Request) {
+
+	body, err := ioutil.ReadAll(request.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	grafanaQueryRequest, err := UnmarshalGrafanaQueryRequest(body)
+
+	log.Println(grafanaQueryRequest)
+
+	requestedWidgetName := grafanaQueryRequest.Targets[0].Target
+	widgetOutputType := grafanaQueryRequest.Targets[0].Type
+
+	if widgetOutputType == "table" {
+		responseJson, httpCode, errorString := convertWidgetToGrafanaTable(requestedWidgetName)
+
+		if errorString != "" {
+			http.Error(writer, errorString, httpCode)
+		} else {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(httpCode)
+			writer.Write(responseJson)
+		}
+	} else {
+		responseJson, httpCode, errorString := convertWidgetToGrafanaTimeSeries(requestedWidgetName)
+
+		if errorString != "" {
+			http.Error(writer, errorString, httpCode)
+		} else {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(httpCode)
+			writer.Write(responseJson)
+		}
+	}
+
+}
+
+func convertWidgetToGrafanaTable(widgetName string) ([]byte, int, string) {
+	_, httpCode, errorString := getWidgetData(widgetName)
+
+	if httpCode != http.StatusOK {
+		return nil, httpCode, errorString
+	}
+
+	widget, found := widgetMap[widgetName]
+	if found != true {
+		return nil, http.StatusNotFound, "Could not find widget in widget map " + widgetName
+	} else {
+		var grafanaRsp GrafanaTableQueryResponse
+		var grafanaRspElement GrafanaTableQueryResponseElement
+
+		dblockCols := widget.currentDataBlock.ColumnList
+
+		for i, _ := range dblockCols {
+			var rspCol GrafanaTableQueryResponseColumn
+			rspCol.Text = dblockCols[i]
+			rspCol.Type = "string"
+			grafanaRspElement.Columns = append(grafanaRspElement.Columns, rspCol)
+		}
+
+		dblockRows := widget.currentDataBlock.Rowdata
+
+		for i, _ := range dblockRows {
+			grafanaRspElement.Rows = append(grafanaRspElement.Rows, dblockRows[i])
+		}
+
+		grafanaRspElement.Type = "table"
+
+		grafanaRsp = append(grafanaRsp, grafanaRspElement)
+
+		response, err := json.Marshal(grafanaRsp)
+		if err == nil {
+			return response, http.StatusOK, ""
+		} else {
+			return nil, http.StatusInternalServerError, err.Error()
+		}
+	}
+}
+
+func convertWidgetToGrafanaTimeSeries(widgetName string) ([]byte, int, string) {
+	_, httpCode, errorString := getWidgetData(widgetName)
+
+	//TODO fix this
+	return nil, httpCode, errorString
+
+}
+
+func postSearchHandler(writer http.ResponseWriter, request *http.Request) {
+
+	var widgetNames []string
+	for key, _ := range widgetMap {
+		widgetNames = append(widgetNames, key)
+	}
+	responseJSON, err := json.Marshal(widgetNames)
+
+	if err == nil {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusOK)
+		writer.Write(responseJSON)
+	} else {
+		http.Error(writer, "Failed to Marshall widgetName list", http.StatusInternalServerError)
+	}
+
+}
+
+func getRoot(writer http.ResponseWriter, request *http.Request) {
+	writer.WriteHeader(http.StatusOK)
+}
+
+func getAllPagesHandler(w http.ResponseWriter, r *http.Request) {
+	responseJson, httpCode, errorString := getAllPages()
+
+	if errorString != "" {
+		http.Error(w, errorString, httpCode)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(httpCode)
+		w.Write(responseJson)
+	}
+}
+
+func getAllPages() ([]byte, int, string) {
+	response, err := json.Marshal(pageMap)
+	if err == nil {
+		return response, http.StatusOK, ""
+	} else {
+		return nil, http.StatusInternalServerError, err.Error()
+	}
 }
 
 func getPageHandler(w http.ResponseWriter, r *http.Request) {
@@ -508,8 +663,71 @@ func getWidgetData(widgetName string) ([]byte, int, string) {
 				} else {
 					return nil, http.StatusInternalServerError, err.Error()
 				}
-
 			}
 		}
 	}
+}
+
+//*************Grafana query json stuff
+func UnmarshalGrafanaQueryRequest(data []byte) (GrafanaQueryRequest, error) {
+	var r GrafanaQueryRequest
+	err := json.Unmarshal(data, &r)
+	return r, err
+}
+
+type GrafanaQueryRequest struct {
+	Timezone      string     `json:"timezone"`
+	PanelID       int64      `json:"panelId"`
+	Range         Range      `json:"range"`
+	RangeRaw      Raw        `json:"rangeRaw"`
+	Interval      string     `json:"interval"`
+	IntervalMS    int64      `json:"intervalMs"`
+	Targets       []Target   `json:"targets"`
+	MaxDataPoints int64      `json:"maxDataPoints"`
+	ScopedVars    ScopedVars `json:"scopedVars"`
+}
+
+type Range struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Raw  Raw    `json:"raw"`
+}
+
+type Raw struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type ScopedVars struct {
+	Interval   Interval   `json:"__interval"`
+	IntervalMS IntervalMS `json:"__interval_ms"`
+}
+
+type Interval struct {
+	Text  string `json:"text"`
+	Value string `json:"value"`
+}
+
+type IntervalMS struct {
+	Text  int64 `json:"text"`
+	Value int64 `json:"value"`
+}
+
+type Target struct {
+	Target string `json:"target"`
+	RefID  string `json:"refId"`
+	Type   string `json:"type"`
+}
+
+type GrafanaTableQueryResponse []GrafanaTableQueryResponseElement
+
+type GrafanaTableQueryResponseElement struct {
+	Columns []GrafanaTableQueryResponseColumn `json:"columns"`
+	Rows    [][]interface{}                   `json:"rows"`
+	Type    string                            `json:"type"`
+}
+
+type GrafanaTableQueryResponseColumn struct {
+	Text string `json:"text"`
+	Type string `json:"type"`
 }
