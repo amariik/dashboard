@@ -3,11 +3,14 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -15,8 +18,8 @@ import (
 	"github.com/go-chi/cors"
 
 	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/godror/godror"
 	_ "github.com/lib/pq"
-	_ "gopkg.in/goracle.v2"
 )
 
 type Query struct {
@@ -31,22 +34,18 @@ type Query struct {
 	lastDatablock   Datablock
 }
 
-type Page struct {
-	Name   string     `json:"name"`
-	Layout [][]string `json:"layout"`
-}
-
-type Widget struct {
-	Name             string `json:"name"`
-	QueryName        string `json:"query_name"`
+type DataSelector struct {
+	Name             string            `json:"name"`
+	QueryName        string            `json:"query_name"`
+	RuleSet          DataSelectorRules `json:"rules"`
 	currentDataBlock Datablock
 }
 
-func (w *Widget) CurrentDataBlock() Datablock {
+func (w *DataSelector) CurrentDataBlock() Datablock {
 	return w.currentDataBlock
 }
 
-func (w *Widget) SetCurrentDataBlock(currentDataBlock Datablock) {
+func (w *DataSelector) SetCurrentDataBlock(currentDataBlock Datablock) {
 	w.currentDataBlock = currentDataBlock
 }
 
@@ -112,9 +111,8 @@ func (cfg MySQLConfig) connectionString() string {
 
 var dbMap = make(map[string]*sql.DB)
 var queryMap = make(map[string]*Query)
-var widgetMap = make(map[string]*Widget)
-var pageMap = make(map[string]*Page)
-var widgetToQueryMap = make(map[string]*Query)
+var dataSelectorMap = make(map[string]*DataSelector)
+var dataSelectorToQueryMap = make(map[string]*Query)
 
 func main() {
 
@@ -147,7 +145,7 @@ func main() {
 
 			json.Unmarshal(jsonData, &oracleDB)
 
-			db, err := sql.Open("goracle", oracleDB.connectionString())
+			db, err := sql.Open("godror", oracleDB.connectionString())
 
 			if err != nil {
 				fmt.Println(err)
@@ -231,80 +229,58 @@ func main() {
 		//fmt.Println(query.Name, query.DatabaseName, query.QueryString, query.ColumnList)
 	}
 
-	// read the cfg/widget folder and load all the widget json files
-	const cfgPathWidget = "./cfg/widget/"
-	widgetFiles, err := ioutil.ReadDir(cfgPathWidget)
+	// read the cfg/dataselector folder and load all the dataselector json files
+	const cfgPathDataSelector = "./cfg/dataselector/"
+	dataSelectorFiles, err := ioutil.ReadDir(cfgPathDataSelector)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	for _, file := range widgetFiles {
-		widgetFile, err := os.Open(cfgPathWidget + file.Name())
+	for _, file := range dataSelectorFiles {
+		dataSelectorFile, err := os.Open(cfgPathDataSelector + file.Name())
 		if err != nil {
 			fmt.Println(err)
 		}
-		defer widgetFile.Close()
+		defer dataSelectorFile.Close()
 
 		var jsonData []byte
-		jsonData, err = ioutil.ReadAll(widgetFile)
+		jsonData, err = ioutil.ReadAll(dataSelectorFile)
 		if err != nil {
 			fmt.Println(err)
 		}
 
-		var widget Widget
-		json.Unmarshal(jsonData, &widget)
-		widgetMap[widget.Name] = &widget
+		var dSelector DataSelector
+		err = json.Unmarshal(jsonData, &dSelector)
+		if err != nil {
+			fmt.Println("Error during processing ", dataSelectorFile, " error: ", err)
+			continue
+		}
+		dataSelectorMap[dSelector.Name] = &dSelector
 
-		query, found := queryMap[widget.QueryName]
+		query, found := queryMap[dSelector.QueryName]
 
 		if found == false {
-			fmt.Println("Could not find query in query map ", widget.QueryName)
+			fmt.Println("Could not find query in query map ", dSelector.QueryName)
 		} else {
-			widgetToQueryMap[widget.Name] = query
+			dataSelectorToQueryMap[dSelector.Name] = query
 		}
 
-	}
-
-	// read the cfg/page folder and load all the page json files
-	const cfgPathPage = "./cfg/page/"
-	pageFiles, err := ioutil.ReadDir(cfgPathPage)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for _, file := range pageFiles {
-		pageFile, err := os.Open(cfgPathPage + file.Name())
-		if err != nil {
-			fmt.Println(err)
-		}
-		defer pageFile.Close()
-
-		var jsonData []byte
-		jsonData, err = ioutil.ReadAll(pageFile)
-		if err != nil {
-			fmt.Println(err)
-		}
-
-		var page Page
-		json.Unmarshal(jsonData, &page)
-		pageMap[page.Name] = &page
 	}
 
 	http.ListenAndServe(":9999", registerRoutes())
 }
 
 // if current time minus last time (all in seconds) is greater than the refreshtime (refresh limiter) then update
-// the data block otherwise return the queries last datablock
-func getDatablockAndUpdateIfNeeded(db *sql.DB, v *Query) (Datablock, error) {
+// the data block otherwise return the queries last datablock. Return bool is if the data was updated or not
+func getDatablockAndUpdateIfNeeded(db *sql.DB, v *Query) (Datablock, error, bool) {
 
-	//timeSinceLastRefresh := time.Now().Unix() - v.lastRefreshTime.Unix()
-	//if timeSinceLastRefresh > int64(v.RefreshTime) {
-	if v.lastDatablock.Rowdata == nil {
+	timeSinceLastRefresh := time.Now().Unix() - v.lastRefreshTime.Unix()
+	if timeSinceLastRefresh > int64(v.RefreshTime) {
 		// atomically check if the value of locker is 0 and if so change it to 1 (locked)
 		// if that is is false then return the older data as if it wasn't time to refresh
 		// as another process is updating this query currently
 		if !atomic.CompareAndSwapUint32(&v.Locker, 0, 1) {
-			return v.lastDatablock, nil
+			return v.lastDatablock, nil, false
 		}
 		defer atomic.StoreUint32(&v.Locker, 0)
 
@@ -313,12 +289,12 @@ func getDatablockAndUpdateIfNeeded(db *sql.DB, v *Query) (Datablock, error) {
 		var allResults = make(map[int][]interface{})
 		rows, err := db.Query(v.QueryString)
 		if err != nil {
-			return result, err
+			return result, err, false
 		}
 		defer rows.Close()
 		cols, err := rows.Columns()
 		if err != nil {
-			return result, err
+			return result, err, false
 		}
 		rowCount := 0
 		for rows.Next() {
@@ -335,7 +311,7 @@ func getDatablockAndUpdateIfNeeded(db *sql.DB, v *Query) (Datablock, error) {
 			// Scan the result into the column pointers...
 			err := rows.Scan(columnPointers...)
 			if err != nil {
-				return result, err
+				return result, err, false
 			}
 
 			allResults[rowCount] = columns
@@ -351,9 +327,9 @@ func getDatablockAndUpdateIfNeeded(db *sql.DB, v *Query) (Datablock, error) {
 
 		v.lastDatablock = datablock
 		v.lastRefreshTime = time.Now()
-		return datablock, nil
+		return datablock, nil, true
 	} else {
-		return v.lastDatablock, nil
+		return v.lastDatablock, nil, false
 	}
 
 }
@@ -375,14 +351,11 @@ func registerRoutes() http.Handler {
 	})
 	router.Use(cors.Handler)
 
-	router.Get("/page/{pageName}", getPageHandler)
-	router.Get("/page/", getAllPagesHandler)
-	router.Get("/widget/{widgetName}", getWidgetHandler)
-	router.Get("/widgetdata/{widgetName}", getWidgetDataHandler)
+	router.Get("/dataselector/{dataSelectorName}", getDataSelectorHandler)
+	router.Get("/dataselectordata/{dataSelectorName}", getDataSelectorDataHandler)
 	router.Get("/query/{queryName}", getQueryHandler)
-
-	// grafana test
 	router.Get("/", getRoot)
+
 	router.Post("/search", postSearchHandler)
 	router.Post("/query", postQueryHandler)
 
@@ -398,13 +371,14 @@ func postQueryHandler(writer http.ResponseWriter, request *http.Request) {
 
 	grafanaQueryRequest, err := UnmarshalGrafanaQueryRequest(body)
 
-	log.Println(grafanaQueryRequest)
+	var requestedDataSelectorNames []string
+	for i := range grafanaQueryRequest.Targets {
+		requestedDataSelectorNames = append(requestedDataSelectorNames, grafanaQueryRequest.Targets[i].Target)
+	}
+	dataSelectorOutputType := grafanaQueryRequest.Targets[0].Type
 
-	requestedWidgetName := grafanaQueryRequest.Targets[0].Target
-	widgetOutputType := grafanaQueryRequest.Targets[0].Type
-
-	if widgetOutputType == "table" {
-		responseJson, httpCode, errorString := convertWidgetToGrafanaTable(requestedWidgetName)
+	if dataSelectorOutputType == "table" {
+		responseJson, httpCode, errorString := convertDataSelectorToGrafanaTable(requestedDataSelectorNames)
 
 		if errorString != "" {
 			http.Error(writer, errorString, httpCode)
@@ -414,7 +388,7 @@ func postQueryHandler(writer http.ResponseWriter, request *http.Request) {
 			writer.Write(responseJson)
 		}
 	} else {
-		responseJson, httpCode, errorString := convertWidgetToGrafanaTimeSeries(requestedWidgetName)
+		responseJson, httpCode, errorString := convertDataSelectorToGrafanaTimeSeries(requestedDataSelectorNames)
 
 		if errorString != "" {
 			http.Error(writer, errorString, httpCode)
@@ -427,70 +401,112 @@ func postQueryHandler(writer http.ResponseWriter, request *http.Request) {
 
 }
 
-func convertWidgetToGrafanaTable(widgetName string) ([]byte, int, string) {
-	_, httpCode, errorString := getWidgetData(widgetName)
+func convertDataSelectorToGrafanaTable(dataSelectorNames []string) ([]byte, int, string) {
+	var grafanaRsp GrafanaTableQueryResponse
 
-	if httpCode != http.StatusOK {
-		return nil, httpCode, errorString
-	}
+	for i := range dataSelectorNames {
 
-	widget, found := widgetMap[widgetName]
-	if found != true {
-		return nil, http.StatusNotFound, "Could not find widget in widget map " + widgetName
-	} else {
-		var grafanaRsp GrafanaTableQueryResponse
-		var grafanaRspElement GrafanaTableQueryResponseElement
+		dataSelectorName := dataSelectorNames[i]
 
-		dblockCols := widget.currentDataBlock.ColumnList
+		_, httpCode, errorString := getDataSelectorData(dataSelectorName)
 
-		for i, _ := range dblockCols {
-			var rspCol GrafanaTableQueryResponseColumn
-			rspCol.Text = dblockCols[i]
-			rspCol.Type = "string"
-			grafanaRspElement.Columns = append(grafanaRspElement.Columns, rspCol)
+		if httpCode != http.StatusOK {
+			return nil, httpCode, errorString
 		}
 
-		dblockRows := widget.currentDataBlock.Rowdata
-
-		for i, _ := range dblockRows {
-			grafanaRspElement.Rows = append(grafanaRspElement.Rows, dblockRows[i])
-		}
-
-		grafanaRspElement.Type = "table"
-
-		grafanaRsp = append(grafanaRsp, grafanaRspElement)
-
-		response, err := json.Marshal(grafanaRsp)
-		if err == nil {
-			return response, http.StatusOK, ""
+		dSelector, found := dataSelectorMap[dataSelectorName]
+		if found != true {
+			return nil, http.StatusNotFound, "Could not find dataselector in dataselector map " + dataSelectorName
 		} else {
-			return nil, http.StatusInternalServerError, err.Error()
+			var grafanaRspElement GrafanaTableQueryResponseElement
+
+			dblockCols := dSelector.currentDataBlock.ColumnList
+
+			for i, _ := range dblockCols {
+				var rspCol GrafanaTableQueryResponseColumn
+				rspCol.Text = dblockCols[i]
+				rspCol.Type = "string"
+				grafanaRspElement.Columns = append(grafanaRspElement.Columns, rspCol)
+			}
+
+			dblockRows := dSelector.currentDataBlock.Rowdata
+
+			for _, k := range sortedKeysForDataBlockData(dblockRows) {
+				grafanaRspElement.Rows = append(grafanaRspElement.Rows, dblockRows[k])
+			}
+
+			grafanaRspElement.Type = "table"
+
+			grafanaRsp = append(grafanaRsp, grafanaRspElement)
+
 		}
+	}
+	response, err := json.Marshal(grafanaRsp)
+	if err == nil {
+		return response, http.StatusOK, ""
+	} else {
+		return nil, http.StatusInternalServerError, err.Error()
 	}
 }
 
-func convertWidgetToGrafanaTimeSeries(widgetName string) ([]byte, int, string) {
-	_, httpCode, errorString := getWidgetData(widgetName)
+func convertDataSelectorToGrafanaTimeSeries(dataSelectorNames []string) ([]byte, int, string) {
 
-	//TODO fix this
-	return nil, httpCode, errorString
+	var grafanaRsp GrafanaTimeSeriesQueryResponse
 
+	for i := range dataSelectorNames {
+
+		dataSelectorName := dataSelectorNames[i]
+		_, httpCode, errorString := getDataSelectorData(dataSelectorName)
+
+		if httpCode != http.StatusOK {
+			return nil, httpCode, errorString
+		}
+
+		dSelector, found := dataSelectorMap[dataSelectorName]
+		if found != true {
+			return nil, http.StatusNotFound, "Could not find dataselector in dataselector map " + dataSelectorName
+		} else {
+
+			var grafanaRspElement GrafanaTimeSeriesQueryResponseElement
+
+			dblockRows := dSelector.currentDataBlock.Rowdata
+
+			for _, k := range sortedKeysForDataBlockData(dblockRows) {
+				datapointTime := dblockRows[k][0].(time.Time)
+				datapointMetric := dblockRows[k][1]
+
+				datapointEpocTime := datapointTime.UnixNano() / 1000000
+
+				datapoint := []interface{}{datapointMetric, datapointEpocTime}
+				grafanaRspElement.Datapoints = append(grafanaRspElement.Datapoints, datapoint)
+
+			}
+
+			grafanaRsp = append(grafanaRsp, grafanaRspElement)
+		}
+	}
+	response, err := json.Marshal(grafanaRsp)
+	if err == nil {
+		return response, http.StatusOK, ""
+	} else {
+		return nil, http.StatusInternalServerError, err.Error()
+	}
 }
 
 func postSearchHandler(writer http.ResponseWriter, request *http.Request) {
 
-	var widgetNames []string
-	for key, _ := range widgetMap {
-		widgetNames = append(widgetNames, key)
+	var dataSelectorNames []string
+	for key, _ := range dataSelectorMap {
+		dataSelectorNames = append(dataSelectorNames, key)
 	}
-	responseJSON, err := json.Marshal(widgetNames)
+	responseJSON, err := json.Marshal(dataSelectorNames)
 
 	if err == nil {
 		writer.Header().Set("Content-Type", "application/json")
 		writer.WriteHeader(http.StatusOK)
 		writer.Write(responseJSON)
 	} else {
-		http.Error(writer, "Failed to Marshall widgetName list", http.StatusInternalServerError)
+		http.Error(writer, "Failed to Marshall dataSelectorName list", http.StatusInternalServerError)
 	}
 
 }
@@ -499,31 +515,10 @@ func getRoot(writer http.ResponseWriter, request *http.Request) {
 	writer.WriteHeader(http.StatusOK)
 }
 
-func getAllPagesHandler(w http.ResponseWriter, r *http.Request) {
-	responseJson, httpCode, errorString := getAllPages()
+func getDataSelectorHandler(w http.ResponseWriter, r *http.Request) {
+	dataSelectorName := chi.URLParam(r, "dataSelectorName")
 
-	if errorString != "" {
-		http.Error(w, errorString, httpCode)
-	} else {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(httpCode)
-		w.Write(responseJson)
-	}
-}
-
-func getAllPages() ([]byte, int, string) {
-	response, err := json.Marshal(pageMap)
-	if err == nil {
-		return response, http.StatusOK, ""
-	} else {
-		return nil, http.StatusInternalServerError, err.Error()
-	}
-}
-
-func getPageHandler(w http.ResponseWriter, r *http.Request) {
-	pageName := chi.URLParam(r, "pageName")
-
-	responseJson, httpCode, errorString := getPage(pageName)
+	responseJson, httpCode, errorString := getDataSelector(dataSelectorName)
 
 	if errorString != "" {
 		http.Error(w, errorString, httpCode)
@@ -535,49 +530,16 @@ func getPageHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // returns
-// json of page requested or nil if error
+// json of dataselector requested or nil if error
 // http status code to use in rsp
 // error string to pass back if error
-func getPage(pageName string) ([]byte, int, string) {
-	requestedPage, found := pageMap[pageName]
+func getDataSelector(dataSelectorName string) ([]byte, int, string) {
+	requestedDataSelector, found := dataSelectorMap[dataSelectorName]
 
 	if found != true {
-		return nil, http.StatusNotFound, "Could not find page in page map " + pageName
+		return nil, http.StatusNotFound, "Could not find dataselector in dataselector map " + dataSelectorName
 	} else {
-		response, err := json.Marshal(requestedPage)
-		if err == nil {
-			return response, http.StatusOK, ""
-		} else {
-			return nil, http.StatusInternalServerError, err.Error()
-		}
-	}
-}
-
-func getWidgetHandler(w http.ResponseWriter, r *http.Request) {
-	widgetName := chi.URLParam(r, "widgetName")
-
-	responseJson, httpCode, errorString := getWidget(widgetName)
-
-	if errorString != "" {
-		http.Error(w, errorString, httpCode)
-	} else {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(httpCode)
-		w.Write(responseJson)
-	}
-}
-
-// returns
-// json of widget requested or nil if error
-// http status code to use in rsp
-// error string to pass back if error
-func getWidget(widgetName string) ([]byte, int, string) {
-	requestedWidget, found := widgetMap[widgetName]
-
-	if found != true {
-		return nil, http.StatusNotFound, "Could not find widget in widget map " + widgetName
-	} else {
-		response, err := json.Marshal(requestedWidget)
+		response, err := json.Marshal(requestedDataSelector)
 		if err == nil {
 			return response, http.StatusOK, ""
 		} else {
@@ -619,10 +581,10 @@ func getQuery(queryName string) ([]byte, int, string) {
 	}
 }
 
-func getWidgetDataHandler(w http.ResponseWriter, r *http.Request) {
-	widgetName := chi.URLParam(r, "widgetName")
+func getDataSelectorDataHandler(w http.ResponseWriter, r *http.Request) {
+	dataSelectorName := chi.URLParam(r, "dataSelectorName")
 
-	responseJson, httpCode, errorString := getWidgetData(widgetName)
+	responseJson, httpCode, errorString := getDataSelectorData(dataSelectorName)
 
 	if errorString != "" {
 		http.Error(w, errorString, httpCode)
@@ -634,28 +596,34 @@ func getWidgetDataHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // returns
-// json of widget's datablock requested or nil if error
+// json of dataselector's datablock requested or nil if error
 // http status code to use in rsp
 // error string to pass back if error
-func getWidgetData(widgetName string) ([]byte, int, string) {
-	widget, found := widgetMap[widgetName]
+func getDataSelectorData(dataSelectorName string) ([]byte, int, string) {
+	dSelector, found := dataSelectorMap[dataSelectorName]
 	if found != true {
-		return nil, http.StatusNotFound, "Could not find widget in widget map " + widgetName
+		return nil, http.StatusNotFound, "Could not find dataselector in dataselector map " + dataSelectorName
 	} else {
-		query, found := queryMap[widget.QueryName]
+		query, found := queryMap[dSelector.QueryName]
 		if found != true {
-			return nil, http.StatusNotFound, "Could not find query in query map " + widget.QueryName
+			return nil, http.StatusNotFound, "Could not find query in query map " + dSelector.QueryName
 		} else {
 			db, found := dbMap[query.DatabaseName]
 
 			if found == false {
 				return nil, http.StatusNotFound, "Could not find database in DB map " + query.DatabaseName
 			} else {
-				datablock, err := getDatablockAndUpdateIfNeeded(db, query)
+				datablock, err, dataUpdated := getDatablockAndUpdateIfNeeded(db, query)
 				if err != nil {
 					return nil, http.StatusInternalServerError, "Error getting results from query " + err.Error()
 				}
-				widget.SetCurrentDataBlock(datablock)
+
+				if dataUpdated {
+					for i := 0; i < len(dSelector.RuleSet.Rules); i++ {
+						datablock, _ = dSelector.RuleSet.Rules[i].ApplyRuleToDataBlock(datablock)
+					}
+					dSelector.SetCurrentDataBlock(datablock)
+				}
 
 				response, err := json.Marshal(datablock)
 				if err == nil {
@@ -666,6 +634,17 @@ func getWidgetData(widgetName string) ([]byte, int, string) {
 			}
 		}
 	}
+}
+
+func sortedKeysForDataBlockData(m map[int][]interface{}) []int {
+	keys := make([]int, len(m))
+	i := 0
+	for k := range m {
+		keys[i] = k
+		i++
+	}
+	sort.Ints(keys)
+	return keys
 }
 
 //*************Grafana query json stuff
@@ -730,4 +709,165 @@ type GrafanaTableQueryResponseElement struct {
 type GrafanaTableQueryResponseColumn struct {
 	Text string `json:"text"`
 	Type string `json:"type"`
+}
+
+type GrafanaTimeSeriesQueryResponse []GrafanaTimeSeriesQueryResponseElement
+
+type GrafanaTimeSeriesQueryResponseElement struct {
+	Datapoints [][]interface{} `json:"datapoints"`
+	Target     string          `json:"target"`
+}
+
+//**************** RULE STUFF ************************
+type DataSelectorRuleActions interface {
+	// returns a datablock and a bool if the rule applied or not
+	ApplyRuleToDataBlock(dataSourceDataBlock Datablock) (Datablock, bool)
+	GetRuleType() string
+}
+
+type DataSelectorRuleSet []DataSelectorRuleActions
+
+type DataSelectorRules struct {
+	Rules DataSelectorRuleSet `json:"rules"`
+}
+
+type GenericDataSelectorRule struct {
+	RuleType string `json:"rule_type"`
+}
+
+type GrafanaTimeSeriesRule struct {
+	RuleType           string `json:"rule_type"`
+	TimeColumnHeader   string `json:"time_column_header"`
+	MetricColumnHeader string `json:"metric_column_header"`
+}
+
+func (rule GrafanaTimeSeriesRule) GetRuleType() string {
+	return rule.RuleType
+}
+
+func (rule GrafanaTimeSeriesRule) ApplyRuleToDataBlock(dataSourceDataBlock Datablock) (Datablock, bool) {
+	var timeColumnIndex int = -1
+	var metricColumnIndex int = -1
+
+	for i := 0; i < len(dataSourceDataBlock.ColumnList); i++ {
+		if dataSourceDataBlock.ColumnList[i] == rule.TimeColumnHeader {
+			timeColumnIndex = i
+		}
+		if dataSourceDataBlock.ColumnList[i] == rule.MetricColumnHeader {
+			metricColumnIndex = i
+		}
+	}
+
+	if timeColumnIndex != -1 && metricColumnIndex != -1 {
+
+		var rowData = make(map[int][]interface{})
+		dblockRows := dataSourceDataBlock.Rowdata
+
+		for _, k := range sortedKeysForDataBlockData(dblockRows) {
+
+			timeColumnData := dblockRows[k][timeColumnIndex]
+			metricColumnData := dblockRows[k][metricColumnIndex]
+
+			rowData[k] = []interface{}{timeColumnData, metricColumnData}
+
+		}
+
+		return Datablock{
+			Title:       dataSourceDataBlock.Title,
+			ColumnList:  []string{rule.TimeColumnHeader, rule.MetricColumnHeader},
+			RowList:     dataSourceDataBlock.RowList,
+			Rowdata:     rowData,
+			UpdatedTime: dataSourceDataBlock.UpdatedTime,
+		}, true
+	}
+
+	return dataSourceDataBlock, false
+}
+
+type FilterRowMatchRegexRule struct {
+	RuleType            string `json:"rule_type"`
+	ColumnHeaderToCheck string `json:"column_header_to_check"`
+	RegexString         string `json:"regex_string"`
+}
+
+func (rule FilterRowMatchRegexRule) GetRuleType() string {
+	return rule.RuleType
+}
+
+func (rule FilterRowMatchRegexRule) ApplyRuleToDataBlock(dataSourceDataBlock Datablock) (Datablock, bool) {
+	var filterColumnIndex int = -1
+
+	for i := 0; i < len(dataSourceDataBlock.ColumnList); i++ {
+		if dataSourceDataBlock.ColumnList[i] == rule.ColumnHeaderToCheck {
+			filterColumnIndex = i
+			break
+		}
+	}
+
+	if filterColumnIndex != -1 {
+
+		var rowData = make(map[int][]interface{})
+		dblockRows := dataSourceDataBlock.Rowdata
+
+		for _, k := range sortedKeysForDataBlockData(dblockRows) {
+			filterColumnData := dblockRows[k][filterColumnIndex].(string)
+
+			matched, err := regexp.MatchString(rule.RegexString, filterColumnData)
+
+			if matched && err == nil {
+				rowData[k] = dblockRows[k]
+			}
+		}
+
+		return Datablock{
+			Title:       dataSourceDataBlock.Title,
+			ColumnList:  dataSourceDataBlock.ColumnList,
+			RowList:     dataSourceDataBlock.RowList,
+			Rowdata:     rowData,
+			UpdatedTime: dataSourceDataBlock.UpdatedTime,
+		}, true
+	}
+
+	return dataSourceDataBlock, false
+}
+
+func (rules *DataSelectorRules) UnmarshalJSON(b []byte) error {
+	rawRules := make([]json.RawMessage, 0)
+
+	err := json.Unmarshal(b, &rawRules)
+
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < len(rawRules); i++ {
+
+		var ruleType GenericDataSelectorRule
+		err := json.Unmarshal(rawRules[i], &ruleType)
+
+		if err != nil {
+			return err
+		}
+
+		if ruleType.RuleType == "timerule" {
+			rule := GrafanaTimeSeriesRule{}
+
+			err := json.Unmarshal(rawRules[i], &rule)
+			if err != nil {
+				return err
+			}
+			rules.Rules = append(rules.Rules, rule)
+		} else if ruleType.RuleType == "regexrule" {
+			rule := FilterRowMatchRegexRule{}
+
+			err := json.Unmarshal(rawRules[i], &rule)
+			if err != nil {
+				return err
+			}
+			rules.Rules = append(rules.Rules, rule)
+		} else {
+			return errors.New("Unknown Ruletype")
+		}
+	}
+	return nil
 }
