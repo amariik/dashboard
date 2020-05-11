@@ -1,0 +1,21 @@
+version: '3'
+
+services:
+
+  dashboard_backend:
+    image: dashboard:latest
+    ports:
+      - 9999:9999
+    volumes:
+      #point to a directory on your local
+      - D:/dockervolumes/dashboard/backend/cfg:/src/dashboard/cfg:rw
+
+  dashboard_grafana:
+    build:
+      dockerfile: ./Dockerfile.Grafana
+      context: ./
+    ports:
+      - 3000:3000
+    volumes:
+      #point to a directory on your local
+      - D:/dockervolumes/dashboard/backend/grafana:/var/lib/grafana:rw

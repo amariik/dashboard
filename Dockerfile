@@ -1,4 +1,4 @@
-FROM oraclelinux:7-slim
+FROM oraclelinux:7-slim as builder
 
 # It is important that these ARG's are defined after the FROM statement
 ARG ACCESS_TOKEN_USR="nothing"
@@ -40,6 +40,19 @@ RUN go mod download
 # Build the executable to `/app`. Mark the build as statically linked.
 RUN go build -o godash
 
+FROM oraclelinux:7-slim as final
+
+ARG release=19
+ARG update=6
+
+RUN  yum -y install oracle-release-el7 && yum-config-manager --enable ol7_oracle_instantclient && \
+     yum -y install oracle-instantclient${release}.${update}-basic
+
+WORKDIR /src/dashboard
+
 COPY ./cfg ./cfg
+COPY --from=builder /src/dashboard/godash /src/dashboard/godash
 
 EXPOSE 9999
+
+ENTRYPOINT ./godash
